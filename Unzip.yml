@@ -1,1 +1,83 @@
 
+name: Unzip archive to repo root
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_name:
+        description: 'Zip file name in repo root (leave empty to auto-detect first .zip)'
+        required: false
+        default: 'SAPRA2-main.zip'
+
+permissions:
+  contents: write
+
+jobs:
+  unzip:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Ensure unzip and rsync are available
+        run: sudo apt-get update && sudo apt-get install -y unzip rsync
+
+      - name: Determine zip file
+        id: findzip
+        run: |
+          if [ -n "${{ github.event.inputs.zip_name }}" ]; then
+            ZIP="${{ github.event.inputs.zip_name }}"
+          else
+            ZIP="$(ls -1 *.zip 2>/dev/null | head -n1 || true)"
+          fi
+          if [ -z "$ZIP" ]; then
+            echo "No zip file found in repo root (or zip_name input was empty)."
+            exit 1
+          fi
+          echo "zip=$ZIP" >> $GITHUB_OUTPUT
+
+      - name: Extract and flatten if single top-level folder
+        run: |
+          set -euo pipefail
+          ZIP="${{ steps.findzip.outputs.zip }}"
+          echo "Extracting '${ZIP}' to a temporary directory..."
+          TMPDIR="$(mktemp -d)"
+          unzip -q "$ZIP" -d "$TMPDIR"
+
+          # Build list of top-level entries excluding __MACOSX
+          mapfile -t entries < <(find "$TMPDIR" -maxdepth 1 -mindepth 1 -printf '%P\n' | sed '/^__MACOSX$/d')
+          if [ "${#entries[@]}" -eq 0 ]; then
+            echo "Archive was empty."
+            rm -rf "$TMPDIR"
+            exit 0
+          fi
+
+          if [ "${#entries[@]}" -eq 1 ] && [ -d "$TMPDIR/${entries[0]}" ]; then
+            echo "Single top-level directory detected: '${entries[0]}'. Moving its contents to repository root."
+            # copy contents of that single directory to repo root (including hidden files)
+            rsync -a --delete "$TMPDIR/${entries[0]}/" .
+          else
+            echo "Multiple top-level entries detected. Moving all extracted items to repository root."
+            rsync -a --delete "$TMPDIR/" .
+          fi
+
+          rm -rf "$TMPDIR"
+          echo "Extraction and move complete."
+
+      - name: Show extracted files (sample)
+        run: ls -la
+
+      - name: Commit and push extracted files (if there are changes)
+        run: |
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git commit -m "Unzip '${{ steps.findzip.outputs.zip }}' into repository root (flatten single top-level folder)"
+            git push
+          fi
